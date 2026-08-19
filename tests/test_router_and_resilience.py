@@ -1,27 +1,33 @@
-"""Unit tests for Rate Limiting, Circuit Breaking, and LLM Router."""
+"""Unit tests for Sliding-Window Rate Limiting, Circuit Breaking, and LLM Router."""
 
 import pytest
 import time
 import asyncio
-from app.resilience.rate_limiter import TokenBucketRateLimiter
+from app.resilience.rate_limiter import SlidingWindowRateLimiter
 from app.resilience.circuit_breaker import CircuitBreaker
 from app.router.providers import MockLLMProvider
 from app.router.llm_router import LLMRouter
 from app.schemas.openai import ChatCompletionRequest, ChatMessage
 
 
-def test_rate_limiter_rpm_and_tpm():
-    limiter = TokenBucketRateLimiter(default_rpm=5, default_tpm=1000, enabled=True)
-    client = "client-test-123"
+def test_sliding_window_rate_limiter():
+    limiter = SlidingWindowRateLimiter(window_seconds=1, max_requests=3, enabled=True)
+    key = "sk-client-test"
 
-    for _ in range(5):
-        allowed, wait, limit_type = limiter.check_limit(client, estimated_tokens=10)
+    # 3 allowed
+    for _ in range(3):
+        allowed, wait = limiter.check_limit(key)
         assert allowed is True
 
-    allowed, wait, limit_type = limiter.check_limit(client, estimated_tokens=10)
+    # 4th in same window blocked
+    allowed, wait = limiter.check_limit(key)
     assert allowed is False
     assert wait > 0
-    assert "RPM" in limit_type
+
+    # Wait for sliding window expiration
+    time.sleep(1.1)
+    allowed, wait = limiter.check_limit(key)
+    assert allowed is True
 
 
 def test_circuit_breaker_transitions():

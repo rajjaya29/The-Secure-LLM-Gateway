@@ -1,70 +1,75 @@
-"""Token Bucket Rate Limiter for request and token throttling."""
+"""In-Memory Sliding-Window Rate Limiter per API key."""
 
 import time
 import threading
-from typing import Dict, Tuple
+from collections import deque
+from typing import Dict, Tuple, Optional
 
 
-class TokenBucket:
-    def __init__(self, capacity: float, refill_rate_per_sec: float):
-        self.capacity = capacity
-        self.refill_rate = refill_rate_per_sec
-        self.tokens = capacity
-        self.last_refill = time.time()
-        self.lock = threading.Lock()
+class SlidingWindowRateLimiter:
+    """
+    In-memory sliding-window rate limiter.
+    Tracks exact request timestamps in a sliding time window (e.g. 60 requests per 60s) per API key.
+    """
 
-    def consume(self, amount: float = 1.0) -> Tuple[bool, float]:
-        with self.lock:
-            now = time.time()
-            elapsed = now - self.last_refill
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
-            self.last_refill = now
-
-            if self.tokens >= amount:
-                self.tokens -= amount
-                return True, 0.0
-            else:
-                needed = amount - self.tokens
-                wait_time = needed / self.refill_rate if self.refill_rate > 0 else 60.0
-                return False, wait_time
-
-
-class TokenBucketRateLimiter:
-    def __init__(self, default_rpm: int = 120, default_tpm: int = 100000, enabled: bool = True):
-        self.default_rpm = default_rpm
-        self.default_tpm = default_tpm
+    def __init__(
+        self,
+        window_seconds: int = 60,
+        max_requests: int = 60,
+        enabled: bool = True,
+    ):
+        self.window_seconds = window_seconds
+        self.max_requests = max_requests
         self.enabled = enabled
-        
-        self._rpm_buckets: Dict[str, TokenBucket] = {}
-        self._tpm_buckets: Dict[str, TokenBucket] = {}
+        self._windows: Dict[str, deque] = {}
         self._lock = threading.Lock()
 
-    def _get_or_create_buckets(self, client_id: str) -> Tuple[TokenBucket, TokenBucket]:
-        with self._lock:
-            if client_id not in self._rpm_buckets:
-                self._rpm_buckets[client_id] = TokenBucket(
-                    capacity=float(self.default_rpm),
-                    refill_rate_per_sec=self.default_rpm / 60.0,
-                )
-            if client_id not in self._tpm_buckets:
-                self._tpm_buckets[client_id] = TokenBucket(
-                    capacity=float(self.default_tpm),
-                    refill_rate_per_sec=self.default_tpm / 60.0,
-                )
-            return self._rpm_buckets[client_id], self._tpm_buckets[client_id]
-
-    def check_limit(self, client_id: str, estimated_tokens: int = 50) -> Tuple[bool, float, str]:
+    def check_limit(self, client_id: str) -> Tuple[bool, float]:
+        """
+        Evaluates if request from client_id is within the sliding window quota.
+        Returns:
+            - allowed (bool)
+            - retry_after_seconds (float)
+        """
         if not self.enabled:
-            return True, 0.0, ""
+            return True, 0.0
 
-        rpm_bucket, tpm_bucket = self._get_or_create_buckets(client_id)
+        now = time.time()
+        window_start = now - self.window_seconds
 
-        rpm_allowed, rpm_wait = rpm_bucket.consume(1.0)
-        if not rpm_allowed:
-            return False, round(rpm_wait, 2), "RPM (Requests Per Minute)"
+        with self._lock:
+            if client_id not in self._windows:
+                self._windows[client_id] = deque()
 
-        tpm_allowed, tpm_wait = tpm_bucket.consume(float(estimated_tokens))
-        if not tpm_allowed:
-            return False, round(tpm_wait, 2), "TPM (Tokens Per Minute)"
+            req_deque = self._windows[client_id]
 
-        return True, 0.0, ""
+            # Evict timestamps outside current sliding window
+            while req_deque and req_deque[0] <= window_start:
+                req_deque.popleft()
+
+            # Check if threshold reached
+            if len(req_deque) >= self.max_requests:
+                oldest_in_window = req_deque[0]
+                retry_after = max(0.1, (oldest_in_window + self.window_seconds) - now)
+                return False, round(retry_after, 2)
+
+            # Record current request timestamp
+            req_deque.append(now)
+            return True, 0.0
+
+    def get_client_usage(self, client_id: str) -> int:
+        """Returns active request count in current sliding window for client."""
+        now = time.time()
+        window_start = now - self.window_seconds
+        with self._lock:
+            req_deque = self._windows.get(client_id)
+            if not req_deque:
+                return 0
+            # Clean expired
+            while req_deque and req_deque[0] <= window_start:
+                req_deque.popleft()
+            return len(req_deque)
+
+    def clear(self):
+        with self._lock:
+            self._windows.clear()

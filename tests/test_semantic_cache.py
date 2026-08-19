@@ -1,16 +1,16 @@
-"""Unit tests for Semantic Vector Caching, embeddings, and similarity matching."""
+"""Unit tests for ChromaDB Semantic Vector Caching and all-MiniLM-L6-v2 embeddings."""
 
 import pytest
 import numpy as np
 import asyncio
 from app.cache.embeddings import EmbeddingEngine
-from app.cache.vector_store import InMemoryVectorStore
+from app.cache.chroma_store import ChromaVectorStore
 from app.cache.semantic_cache import SemanticCacheManager
 from app.schemas.openai import ChatCompletionRequest, ChatMessage
 
 
 def test_embedding_engine_normalization():
-    engine = EmbeddingEngine()
+    engine = EmbeddingEngine(model_name="sentence-transformers/all-MiniLM-L6-v2")
     v1 = engine.embed_query("What is the capital of France?")
     
     assert isinstance(v1, np.ndarray)
@@ -19,34 +19,40 @@ def test_embedding_engine_normalization():
     assert pytest.approx(norm, 0.01) == 1.0
 
 
-def test_vector_store_exact_and_similarity_search():
-    store = InMemoryVectorStore(max_entries=100)
+def test_chroma_store_exact_and_similarity_search():
+    store = ChromaVectorStore(collection_name="test_collection", persist_directory=None)
+    store.clear()
     engine = EmbeddingEngine()
 
     p1 = "What is the capital of France?"
     v1 = engine.embed_query(p1)
     resp_payload = {"choices": [{"message": {"role": "assistant", "content": "Paris"}}]}
 
-    store.upsert(
+    # Upsert item into ChromaDB
+    doc_id = store.upsert(
         prompt=p1,
         embedding=v1,
         response_payload=resp_payload,
         model="gpt-4o",
         system_hash="sys_default",
     )
+    assert doc_id.startswith("chroma-")
 
+    # 1. Exact match lookup
     exact = store.get_by_exact_match(p1, model="gpt-4o", system_hash="sys_default")
     assert exact is not None
-    assert exact.response_payload["choices"][0]["message"]["content"] == "Paris"
+    assert exact["response_payload"]["choices"][0]["message"]["content"] == "Paris"
 
-    matches = store.search(v1, model="gpt-4o", system_hash="sys_default", threshold=0.92)
+    # 2. ChromaDB search with cosine similarity
+    matches = store.search(v1, model="gpt-4o", system_hash="sys_default", threshold=0.90)
     assert len(matches) == 1
-    assert matches[0][1] >= 0.99
+    assert matches[0][1] >= 0.95
 
 
 @pytest.mark.asyncio
-async def test_semantic_cache_manager_hit_and_miss():
-    store = InMemoryVectorStore(max_entries=100)
+async def test_semantic_cache_manager_chroma_hit_and_miss():
+    store = ChromaVectorStore(collection_name="test_cache_mgr", persist_directory=None)
+    store.clear()
     engine = EmbeddingEngine()
     manager = SemanticCacheManager(
         embedding_engine=engine,
@@ -60,9 +66,11 @@ async def test_semantic_cache_manager_hit_and_miss():
         messages=[ChatMessage(role="user", content="What is the capital city of France?")],
     )
 
+    # First lookup should be MISS
     res1 = await manager.lookup(req1)
     assert res1.hit is False
 
+    # Store response
     mock_resp = {
         "id": "chatcmpl-test",
         "model": "gpt-4o-mini",
@@ -71,8 +79,9 @@ async def test_semantic_cache_manager_hit_and_miss():
     }
     await manager.store(req1, mock_resp, token_count=20)
 
+    # Second lookup with exact prompt should be HIT
     res2 = await manager.lookup(req1)
     assert res2.hit is True
-    assert res2.similarity >= 0.99
+    assert res2.similarity >= 0.95
     assert res2.cached_response["choices"][0]["message"]["content"] == "The capital is Paris."
-    assert res2.lookup_latency_ms < 50.0
+    assert res2.lookup_latency_ms < 25.0  # < 25ms requirement

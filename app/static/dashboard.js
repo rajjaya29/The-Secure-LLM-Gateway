@@ -27,7 +27,9 @@ document.getElementById("prompt-input").addEventListener("input", updateCharCoun
 
 async function fetchStats() {
   try {
-    const res = await fetch("/v1/gateway/stats");
+    const res = await fetch("/v1/gateway/stats", {
+      headers: { "X-API-Key": "sk-test-key-123" },
+    });
     if (!res.ok) return;
     const data = await res.json();
 
@@ -103,6 +105,7 @@ async function sendPrompt() {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "X-API-Key": "sk-test-key-123",
         "X-Similarity-Threshold": threshold.toString(),
       },
       body: JSON.stringify(payload),
@@ -195,7 +198,10 @@ async function sendPrompt() {
 async function clearCache() {
   if (!confirm("Are you sure you want to clear the semantic vector cache?")) return;
   try {
-    const res = await fetch("/v1/gateway/cache", { method: "DELETE" });
+    const res = await fetch("/v1/gateway/cache", {
+      method: "DELETE",
+      headers: { "X-API-Key": "sk-test-key-123" },
+    });
     if (res.ok) {
       alert("Semantic cache successfully cleared.");
       fetchStats();

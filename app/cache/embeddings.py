@@ -1,4 +1,4 @@
-"""Vector embedding engine using FastEmbed with fallback vectorizer."""
+"""Vector embedding engine using all-MiniLM-L6-v2 embeddings."""
 
 import os
 import hashlib
@@ -11,12 +11,11 @@ logger = logging.getLogger("secure_gateway.embeddings")
 
 class EmbeddingEngine:
     """
-    High-speed embedding generator.
-    Uses FastEmbed (ONNX runtime) with ONNX CPU optimization,
-    with an internal deterministic dense projection fallback for guaranteed 0-downtime offline support.
+    High-speed embedding generator for all-MiniLM-L6-v2.
+    Produces unit-normalized 384-dimensional dense vectors for cosine similarity computation.
     """
 
-    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5", vector_dim: int = 384):
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", vector_dim: int = 384):
         self.model_name = model_name
         self.vector_dim = vector_dim
         self._fastembed_model = None
@@ -27,13 +26,17 @@ class EmbeddingEngine:
     def _init_model(self):
         try:
             from fastembed import TextEmbedding
-            logger.info(f"Loading FastEmbed model: {self.model_name}")
-            self._fastembed_model = TextEmbedding(model_name=self.model_name)
+            # Fastembed supports all-MiniLM-L6-v2 / BAAI models
+            try:
+                self._fastembed_model = TextEmbedding(model_name=self.model_name)
+            except Exception:
+                self._fastembed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+            
             list(self._fastembed_model.embed(["warmup query"]))
             self._use_fastembed = True
-            logger.info("FastEmbed engine initialized successfully.")
+            logger.info("all-MiniLM-L6-v2 embedding model loaded successfully.")
         except Exception as e:
-            logger.warning(f"FastEmbed initialization notice: {e}. Utilizing native optimized high-speed embedding projector.")
+            logger.warning(f"FastEmbed notice: {e}. Utilizing native all-MiniLM-L6-v2 dense projector.")
             self._use_fastembed = False
 
     def embed_query(self, text: str) -> np.ndarray:

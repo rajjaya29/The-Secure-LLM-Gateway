@@ -22,24 +22,28 @@ from app.schemas.gateway import (
     GuardrailTestResponse,
     GuardrailThreat,
 )
+from app.resilience.auth import verify_api_key
+from app.resilience.rate_limiter import SlidingWindowRateLimiter
 from app.guardrails.injection_detector import InjectionDetector
 from app.guardrails.pii_scrubber import PIIScrubber
 from app.guardrails.output_guardrail import OutputGuardrail
 from app.cache.semantic_cache import SemanticCacheManager
-from app.cache.vector_store import InMemoryVectorStore
+from app.cache.chroma_store import ChromaVectorStore
 from app.cache.embeddings import EmbeddingEngine
-from app.resilience.rate_limiter import TokenBucketRateLimiter
 from app.router.llm_router import LLMRouter
 from app.router.providers import MockLLMProvider, OpenAIProvider, AnthropicProvider, OllamaProvider
 from app.observability.metrics import metrics
 from app.observability.logging import get_logger
+from app.observability.database import sqlite_logger
 
 logger = get_logger()
 router = APIRouter()
 
-vector_store = InMemoryVectorStore(
+# Singletons
+vector_store = ChromaVectorStore(
+    collection_name="semantic_cache",
+    persist_directory=None,  # In-memory ChromaDB for fast test/runtime execution
     max_entries=settings.CACHE_MAX_ENTRIES,
-    default_ttl_seconds=settings.CACHE_TTL_SECONDS,
 )
 embedding_engine = EmbeddingEngine(model_name=settings.EMBEDDING_MODEL)
 cache_manager = SemanticCacheManager(
@@ -59,14 +63,14 @@ output_guardrail = OutputGuardrail(
     pii_scrubber=pii_scrubber,
 )
 
-rate_limiter = TokenBucketRateLimiter(
-    default_rpm=settings.RATE_LIMIT_RPM,
-    default_tpm=settings.RATE_LIMIT_TPM,
+rate_limiter = SlidingWindowRateLimiter(
+    window_seconds=settings.RATE_LIMIT_WINDOW_SECONDS,
+    max_requests=settings.RATE_LIMIT_MAX_REQUESTS,
     enabled=settings.ENABLE_RATE_LIMITING,
 )
 
 providers_dict = {
-    "mock": MockLLMProvider(name="mock"),
+    "mock": MockLLMProvider(name="mock", simulated_latency_ms=80.0),
     "openai": OpenAIProvider(api_key=settings.OPENAI_API_KEY, base_url=settings.OPENAI_BASE_URL),
     "anthropic": AnthropicProvider(api_key=settings.ANTHROPIC_API_KEY, base_url=settings.ANTHROPIC_BASE_URL),
     "ollama": OllamaProvider(base_url=settings.OLLAMA_BASE_URL, default_model=settings.OLLAMA_MODEL),
@@ -81,73 +85,96 @@ llm_router = LLMRouter(
 )
 
 
-def get_client_identifier(request: Request) -> str:
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer ") and len(auth_header) > 7:
-        return auth_header[7:].strip()
-    return request.client.host if request.client else "127.0.0.1"
-
-
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     chat_request: ChatCompletionRequest,
     raw_request: Request,
     response: Response,
     background_tasks: BackgroundTasks,
+    api_key: str = Depends(verify_api_key),
     x_preferred_provider: Optional[str] = Header(default=None, alias="X-Preferred-Provider"),
     x_similarity_threshold: Optional[float] = Header(default=None, alias="X-Similarity-Threshold"),
 ):
+    """
+    Authenticated, rate-limited LLM API Proxy with ChromaDB Semantic Caching:
+    1. X-API-Key Authentication
+    2. In-Memory Sliding-Window Rate Limiting per API Key
+    3. Input Prompt Validation & Guardrails (Prompt Injection + PII Scrubbing)
+    4. ChromaDB Semantic Vector Cache (all-MiniLM-L6-v2, cosine sim >= 0.90 -> < 25ms HIT)
+    5. Upstream Provider Routing with Fallback
+    6. Output Verification & Asynchronous SQLite Request Logging
+    """
     start_time = time.perf_counter()
     request_id = str(uuid.uuid4())
-    client_id = get_client_identifier(raw_request)
 
-    # 1. Rate Limiting Check
-    estimated_prompt_tokens = sum(len(m.content.split()) * 2 for m in chat_request.messages)
-    allowed, wait_seconds, limit_type = rate_limiter.check_limit(client_id, estimated_tokens=estimated_prompt_tokens)
+    # 1. In-Memory Sliding-Window Rate Limiting Check per API key
+    allowed, wait_seconds = rate_limiter.check_limit(api_key)
     if not allowed:
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limit exceeded for {limit_type}. Please retry after {wait_seconds} seconds.",
+            detail=f"Rate limit exceeded ({settings.RATE_LIMIT_MAX_REQUESTS} req/{settings.RATE_LIMIT_WINDOW_SECONDS}s). Please retry after {wait_seconds} seconds.",
             headers={"Retry-After": str(int(wait_seconds) + 1)},
         )
 
-    # 2. Input Guardrails
+    # 2. Input Prompt Validation & Guardrails
     scrubbed_messages: List[ChatMessage] = []
     pii_entities_count = 0
     token_mapping_all: Dict[str, str] = {}
+    raw_user_prompt = ""
 
     for msg in chat_request.messages:
         content = msg.content
-        if msg.role == "user" and not chat_request.bypass_guardrails:
-            if settings.ENABLE_INJECTION_GUARDRAIL:
-                guard_res = injection_detector.detect(content)
-                if guard_res.blocked:
-                    metrics.record_guardrail_block(reason="prompt_injection")
-                    logger.warning(f"Blocked prompt injection attempt from client {client_id}: score={guard_res.injection_score}")
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "error": "Prompt Rejected by Security Guardrail",
-                            "reason": "Prompt Injection / Jailbreak vector detected",
-                            "injection_score": guard_res.injection_score,
-                            "threats": [t.model_dump() for t in guard_res.threats],
-                        },
-                    )
+        if msg.role == "user":
+            raw_user_prompt = content
+            if not chat_request.bypass_guardrails:
+                # 2a. Prompt Injection Check
+                if settings.ENABLE_INJECTION_GUARDRAIL:
+                    guard_res = injection_detector.detect(content)
+                    if guard_res.blocked:
+                        elapsed_ms = (time.perf_counter() - start_time) * 1000
+                        metrics.record_guardrail_block(reason="prompt_injection")
+                        
+                        # Asynchronously log blocked attack to SQLite
+                        background_tasks.add_task(
+                            sqlite_logger.log_request,
+                            api_key=api_key,
+                            model=chat_request.model,
+                            prompt=raw_user_prompt,
+                            response="BLOCKED_BY_GUARDRAIL",
+                            latency_ms=elapsed_ms,
+                            cache_hit=False,
+                            similarity=0.0,
+                            provider="guardrail",
+                            injection_blocked=True,
+                            status_code=400,
+                        )
 
-            if settings.ENABLE_PII_SCRUBBING:
-                sanitized_text, detected_pii, t_map = pii_scrubber.scrub(content)
-                if detected_pii:
-                    pii_entities_count += len(detected_pii)
-                    token_mapping_all.update(t_map)
-                    for entity in detected_pii:
-                        metrics.record_pii_scrubbed(entity["type"])
-                content = sanitized_text
+                        logger.warning(f"Blocked prompt injection from API key {api_key}: score={guard_res.injection_score}")
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "error": "Prompt Rejected by Security Guardrail",
+                                "reason": "Prompt Injection / Jailbreak vector detected",
+                                "injection_score": guard_res.injection_score,
+                                "threats": [t.model_dump() for t in guard_res.threats],
+                            },
+                        )
+
+                # 2b. PII Scrubbing
+                if settings.ENABLE_PII_SCRUBBING:
+                    sanitized_text, detected_pii, t_map = pii_scrubber.scrub(content)
+                    if detected_pii:
+                        pii_entities_count += len(detected_pii)
+                        token_mapping_all.update(t_map)
+                        for entity in detected_pii:
+                            metrics.record_pii_scrubbed(entity["type"])
+                    content = sanitized_text
 
         scrubbed_messages.append(ChatMessage(role=msg.role, content=content, name=msg.name))
 
     sanitized_request = chat_request.model_copy(update={"messages": scrubbed_messages})
 
-    # 3. Semantic Vector Cache Lookup
+    # 3. ChromaDB Semantic Vector Cache Lookup (Cosine Similarity >= 0.90)
     cache_threshold = x_similarity_threshold or settings.CACHE_SIMILARITY_THRESHOLD
     cache_res = await cache_manager.lookup(sanitized_request, custom_threshold=cache_threshold)
     metrics.record_cache_lookup_latency(cache_res.lookup_latency_ms)
@@ -159,13 +186,15 @@ async def chat_completions(
         completion_resp = ChatCompletionResponse(**cached_dict)
         completion_resp.id = f"chatcmpl-cache-{uuid.uuid4().hex[:8]}"
 
+        # Set Telemetry Headers
         response.headers["X-Cache-Status"] = "HIT"
         response.headers["X-Cache-Similarity"] = str(cache_res.similarity)
         response.headers["X-Cache-Lookup-Ms"] = str(cache_res.lookup_latency_ms)
         response.headers["X-Latency-Ms"] = f"{elapsed_ms:.2f}"
-        response.headers["X-Provider-Used"] = "semantic-cache"
+        response.headers["X-Provider-Used"] = "chroma-semantic-cache"
         response.headers["X-PII-Entities-Scrubbed"] = str(pii_entities_count)
 
+        # Record Metrics & Structured SQLite Log
         metrics.record_request(
             status="200",
             model=chat_request.model,
@@ -174,6 +203,24 @@ async def chat_completions(
             prompt_tokens=completion_resp.usage.prompt_tokens,
             completion_tokens=completion_resp.usage.completion_tokens,
         )
+
+        background_tasks.add_task(
+            sqlite_logger.log_request,
+            api_key=api_key,
+            model=chat_request.model,
+            prompt=raw_user_prompt,
+            response=completion_resp.choices[0].message.content,
+            latency_ms=elapsed_ms,
+            cache_hit=True,
+            similarity=cache_res.similarity,
+            provider="chroma-semantic-cache",
+            prompt_tokens=completion_resp.usage.prompt_tokens,
+            completion_tokens=completion_resp.usage.completion_tokens,
+            pii_scrubbed_count=pii_entities_count,
+            injection_blocked=False,
+            status_code=200,
+        )
+
         return completion_resp
 
     # 4. Cache MISS -> Fallback Multi-Provider LLM Routing
@@ -189,13 +236,13 @@ async def chat_completions(
         logger.error(f"Provider routing failure: {ex}")
         raise HTTPException(status_code=502, detail=f"All upstream LLM providers failed: {ex}")
 
-    # 5. Output Guardrail
+    # 5. Output Guardrail Verification
     if settings.ENABLE_OUTPUT_GUARDRAIL and completion_resp.choices:
         orig_reply = completion_resp.choices[0].message.content
         cleaned_reply, is_safe, violations = output_guardrail.verify_and_clean(orig_reply)
         completion_resp.choices[0].message.content = cleaned_reply
 
-    # 6. Asynchronous Background Cache Storage
+    # 6. Asynchronous Background ChromaDB Storage & SQLite Logging
     background_tasks.add_task(
         cache_manager.store,
         sanitized_request,
@@ -221,6 +268,23 @@ async def chat_completions(
         completion_tokens=completion_resp.usage.completion_tokens,
     )
 
+    background_tasks.add_task(
+        sqlite_logger.log_request,
+        api_key=api_key,
+        model=chat_request.model,
+        prompt=raw_user_prompt,
+        response=completion_resp.choices[0].message.content,
+        latency_ms=elapsed_ms,
+        cache_hit=False,
+        similarity=0.0,
+        provider=provider_used,
+        prompt_tokens=completion_resp.usage.prompt_tokens,
+        completion_tokens=completion_resp.usage.completion_tokens,
+        pii_scrubbed_count=pii_entities_count,
+        injection_blocked=False,
+        status_code=200,
+    )
+
     return completion_resp
 
 
@@ -237,27 +301,31 @@ async def list_models():
     return ModelList(data=cards)
 
 
-@router.get("/gateway/stats", response_model=GatewayStatsResponse)
+@router.get("/gateway/stats")
+@router.get("/stats")
 async def get_gateway_stats():
-    stats = metrics.get_summary_stats()
+    """Returns live cache-hit ratios, latency distributions, and per-key usage from SQLite."""
+    sqlite_stats = await sqlite_logger.get_analytics()
     provider_statuses = llm_router.get_provider_statuses()
 
-    return GatewayStatsResponse(
-        uptime_seconds=stats["uptime_seconds"],
-        total_requests=stats["total_requests"],
-        cache_hits=stats["cache_hits"],
-        cache_misses=stats["cache_misses"],
-        cache_hit_ratio=stats["cache_hit_ratio"],
-        total_injections_blocked=stats["total_injections_blocked"],
-        total_pii_entities_scrubbed=stats["total_pii_entities_scrubbed"],
-        total_tokens_served=stats["total_tokens_served"],
-        estimated_tokens_saved=stats["estimated_tokens_saved"],
-        avg_cached_latency_ms=stats["avg_cached_latency_ms"],
-        avg_upstream_latency_ms=stats["avg_upstream_latency_ms"],
-        providers=provider_statuses,
-        cache_size=vector_store.size,
-        cache_max_size=vector_store.max_entries,
-    )
+    return {
+        "uptime_seconds": metrics.get_summary_stats()["uptime_seconds"],
+        "total_requests": sqlite_stats["total_requests"],
+        "cache_hits": sqlite_stats["cache_hits"],
+        "cache_misses": sqlite_stats["cache_misses"],
+        "cache_hit_ratio": sqlite_stats["cache_hit_ratio"],
+        "total_injections_blocked": sqlite_stats["total_injections_blocked"],
+        "total_pii_entities_scrubbed": sqlite_stats["total_pii_entities_scrubbed"],
+        "total_tokens_served": sqlite_stats["total_tokens_served"],
+        "estimated_tokens_saved": sqlite_stats["estimated_tokens_saved"],
+        "avg_cached_latency_ms": sqlite_stats["avg_cached_latency_ms"],
+        "avg_upstream_latency_ms": sqlite_stats["avg_upstream_latency_ms"],
+        "latency_distribution": sqlite_stats["latency_distribution"],
+        "per_key_usage": sqlite_stats["per_key_usage"],
+        "providers": [p.model_dump() for p in provider_statuses],
+        "cache_size": vector_store.size,
+        "cache_max_size": vector_store.max_entries,
+    }
 
 
 @router.post("/gateway/guardrails/test", response_model=GuardrailTestResponse)
