@@ -15,7 +15,7 @@ class InjectionDetector:
 
     HIGH_SEVERITY_PATTERNS = [
         (
-            r"(?i)\b(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+)?(?:previous|prior|above|former)\s+(?:instructions?|directives?|rules?|constraints?|prompts?)\b",
+            r"(?i)\b(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+|any\s+|your\s+|the\s+|prior\s+|previous\s+|above\s+|former\s+)*(?:instructions?|directives?|rules?|constraints?|prompts?|guidelines?|filters?)\b",
             "Direct instruction override attempt",
             0.95,
         ),
@@ -40,12 +40,12 @@ class InjectionDetector:
             0.85,
         ),
         (
-            r"(?i)\b(?:verbatim|word-for-word)\s+(?:repeat|output|show)\s+(?:everything|all\s+text)\s+(?:above|from\s+the\s+beginning)\b",
+            r"(?i)\b(?:verbatim|word-for-word|repeat\s+(?:the\s+)?(?:words?|text|everything)\s+(?:above|verbatim))\b",
             "Context window verbatim extraction attempt",
             0.80,
         ),
         (
-            r"(?i)\bact\s+as\s+(?:an?\s+)?unaligned\s+AI\s+without\s+(?:any\s+)?(?:ethics|morals|rules|filters)\b",
+            r"(?i)\b(?:act\s+as|pretend\s+to\s+be)\s+(?:an?\s+)?(?:unaligned|unrestricted|unfiltered|evil|god\s+mode)\s+(?:AI|assistant|bot)\b",
             "Ethical constraint removal instruction",
             0.88,
         ),
