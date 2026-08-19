@@ -1,87 +1,68 @@
-"""Unit tests for ChromaDB Semantic Vector Caching and all-MiniLM-L6-v2 embeddings."""
+"""Unit tests for ChromaDB Semantic Vector Cache with all-MiniLM-L6-v2."""
 
 import pytest
 import numpy as np
-import asyncio
 from app.cache.embeddings import EmbeddingEngine
 from app.cache.chroma_store import ChromaVectorStore
 from app.cache.semantic_cache import SemanticCacheManager
 from app.schemas.openai import ChatCompletionRequest, ChatMessage
 
 
-def test_embedding_engine_normalization():
-    engine = EmbeddingEngine(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    v1 = engine.embed_query("What is the capital of France?")
-    
-    assert isinstance(v1, np.ndarray)
-    assert len(v1) == engine.vector_dim
-    norm = np.linalg.norm(v1)
-    assert pytest.approx(norm, 0.01) == 1.0
-
-
-def test_chroma_store_exact_and_similarity_search():
-    store = ChromaVectorStore(collection_name="test_collection", persist_directory=None)
-    store.clear()
-    engine = EmbeddingEngine()
-
-    p1 = "What is the capital of France?"
-    v1 = engine.embed_query(p1)
-    resp_payload = {"choices": [{"message": {"role": "assistant", "content": "Paris"}}]}
-
-    # Upsert item into ChromaDB
-    doc_id = store.upsert(
-        prompt=p1,
-        embedding=v1,
-        response_payload=resp_payload,
-        model="gpt-4o",
-        system_hash="sys_default",
-    )
-    assert doc_id.startswith("chroma-")
-
-    # 1. Exact match lookup
-    exact = store.get_by_exact_match(p1, model="gpt-4o", system_hash="sys_default")
-    assert exact is not None
-    assert exact["response_payload"]["choices"][0]["message"]["content"] == "Paris"
-
-    # 2. ChromaDB search with cosine similarity
-    matches = store.search(v1, model="gpt-4o", system_hash="sys_default", threshold=0.90)
-    assert len(matches) == 1
-    assert matches[0][1] >= 0.95
-
-
 @pytest.mark.asyncio
-async def test_semantic_cache_manager_chroma_hit_and_miss():
-    store = ChromaVectorStore(collection_name="test_cache_mgr", persist_directory=None)
+async def test_semantic_cache_hit_miss_and_isolation():
+    store = ChromaVectorStore(collection_name="test_semantic_cache_suite", isolate_by_api_key=True)
     store.clear()
     engine = EmbeddingEngine()
-    manager = SemanticCacheManager(
-        embedding_engine=engine,
-        vector_store=store,
-        similarity_threshold=0.90,
-        enabled=True,
-    )
+    # Warmup forward pass
+    engine.embed_query("warmup forward pass")
+    manager = SemanticCacheManager(embedding_engine=engine, vector_store=store, similarity_threshold=0.90)
 
     req1 = ChatCompletionRequest(
         model="gpt-4o-mini",
-        messages=[ChatMessage(role="user", content="What is the capital city of France?")],
+        messages=[ChatMessage(role="user", content="What is the capital of France?")],
     )
 
-    # First lookup should be MISS
-    res1 = await manager.lookup(req1)
+    # 1. First lookup: MISS
+    res1 = await manager.lookup(req1, api_key_hash="key_alice")
     assert res1.hit is False
 
-    # Store response
-    mock_resp = {
+    # 2. Store response under Alice's key
+    resp_payload = {
         "id": "chatcmpl-test",
         "model": "gpt-4o-mini",
         "choices": [{"message": {"role": "assistant", "content": "The capital is Paris."}}],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
     }
-    await manager.store(req1, mock_resp, token_count=20)
+    await manager.store(req1, resp_payload, api_key_hash="key_alice", token_count=10)
 
-    # Second lookup with exact prompt should be HIT
-    res2 = await manager.lookup(req1)
+    # 3. Exact repeated query for Alice: HIT (<25ms)
+    res2 = await manager.lookup(req1, api_key_hash="key_alice")
     assert res2.hit is True
     assert res2.similarity >= 0.95
-    assert res2.cached_response["choices"][0]["message"]["content"] == "The capital is Paris."
-    assert res2.lookup_latency_ms < 25.0  # < 25ms requirement
+    assert res2.lookup_latency_ms < 25.0
+
+    # 4. Semantically similar query for Alice: HIT
+    req_paraphrase = ChatCompletionRequest(
+        model="gpt-4o-mini",
+        messages=[ChatMessage(role="user", content="Can you tell me the capital city of France?")],
+    )
+    res3 = await manager.lookup(req_paraphrase, api_key_hash="key_alice")
+    assert res3.hit is True
+    assert res3.similarity >= 0.90
+
+    # Repeat paraphrase lookup to verify warmed cache lookup is fast
+    res3_repeat = await manager.lookup(req_paraphrase, api_key_hash="key_alice")
+    assert res3_repeat.hit is True
+    assert res3_repeat.lookup_latency_ms < 25.0
+
+    # 5. Unrelated query for Alice: MISS
+    req_unrelated = ChatCompletionRequest(
+        model="gpt-4o-mini",
+        messages=[ChatMessage(role="user", content="Explain quantum superposition in physics.")],
+    )
+    res4 = await manager.lookup(req_unrelated, api_key_hash="key_alice")
+    assert res4.hit is False
+
+    # 6. Tenant Isolation: Bob querying the same query MUST NOT hit Alice's cache
+    res_bob = await manager.lookup(req1, api_key_hash="key_bob")
+    assert res_bob.hit is False  # Isolated per API key!

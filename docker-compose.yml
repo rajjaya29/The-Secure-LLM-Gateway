@@ -1,46 +1,21 @@
+version: '3.8'
+
 services:
   gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: secure-llm-gateway
+    build: .
+    container_name: secure_llm_gateway
     ports:
       - "8000:8000"
     environment:
       - HOST=0.0.0.0
       - PORT=8000
-      - ENABLE_SEMANTIC_CACHE=true
-      - CACHE_SIMILARITY_THRESHOLD=0.92
-      - ENABLE_INJECTION_GUARDRAIL=true
-      - ENABLE_PII_SCRUBBING=true
+      - REQUIRE_API_KEY=true
+      - RATE_LIMIT_REQUESTS=60
+      - RATE_LIMIT_WINDOW_SECONDS=60
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - SEMANTIC_SIMILARITY_THRESHOLD=0.90
       - DEFAULT_PROVIDER=mock
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
-  prometheus:
-    image: prom/prometheus:v2.50.0
-    container_name: gateway-prometheus
-    ports:
-      - "9090:9090"
+      - SQLITE_DB_PATH=gateway_logs.db
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    restart: unless-stopped
-
-  grafana:
-    image: grafana/grafana:10.3.3
-    container_name: gateway-grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    depends_on:
-      - prometheus
+      - ./gateway_data:/app/data
     restart: unless-stopped

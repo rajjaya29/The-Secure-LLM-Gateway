@@ -13,7 +13,6 @@ from app.api.v1.routes import router as api_v1_router
 from app.observability.metrics import metrics
 from app.observability.logging import setup_structured_logging
 from app.observability.database import sqlite_logger
-from app.router.llm_router import LLMRouter
 
 logger = setup_structured_logging(debug=settings.DEBUG)
 
@@ -21,16 +20,16 @@ logger = setup_structured_logging(debug=settings.DEBUG)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME} on {settings.HOST}:{settings.PORT}...")
-    logger.info(f"ChromaDB Semantic Cache enabled: {settings.ENABLE_SEMANTIC_CACHE} (Threshold: {settings.CACHE_SIMILARITY_THRESHOLD})")
-    logger.info(f"API-Key Authentication: {settings.REQUIRE_API_KEY} (Sliding-Window: {settings.RATE_LIMIT_MAX_REQUESTS} req / {settings.RATE_LIMIT_WINDOW_SECONDS}s)")
+    logger.info(f"ChromaDB Semantic Cache: {settings.ENABLE_SEMANTIC_CACHE} (Threshold: {settings.SEMANTIC_SIMILARITY_THRESHOLD})")
+    logger.info(f"API-Key Authentication: {settings.REQUIRE_API_KEY} (Sliding-Window: {settings.RATE_LIMIT_REQUESTS} req / {settings.RATE_LIMIT_WINDOW_SECONDS}s)")
     logger.info(f"SQLite Structured Logging: {settings.SQLITE_DB_PATH}")
     yield
-    logger.info("Shutting down Secure LLM Gateway...")
+    logger.info(f"Shutting down {settings.APP_NAME}...")
 
 
 app = FastAPI(
     title=settings.APP_NAME,
-    description="An authenticated, rate-limited LLM reverse-proxy in FastAPI with ChromaDB semantic caching, sliding-window rate limiting, and SQLite analytics.",
+    description="An authenticated, rate-limited LLM API proxy in FastAPI with ChromaDB semantic caching, sliding-window rate limiting, and SQLite analytics.",
     version="1.1.0",
     lifespan=lifespan,
 )
@@ -52,7 +51,7 @@ async def request_middleware(request: Request, call_next):
 
     try:
         response: Response = await call_next(request)
-        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Gateway-Time-Ms"] = f"{elapsed_ms:.2f}"
         return response
@@ -69,7 +68,7 @@ async def health():
         "status": "healthy",
         "gateway": settings.APP_NAME,
         "semantic_cache": "active (ChromaDB + all-MiniLM-L6-v2)",
-        "guardrails": "active",
+        "rate_limiter": "active (in-memory sliding-window)",
         "auth": "X-API-Key required" if settings.REQUIRE_API_KEY else "disabled",
     }
 
@@ -77,8 +76,7 @@ async def health():
 @app.get("/stats")
 async def root_stats():
     """Live analytics metrics endpoint tracking cache-hit ratios, latency distributions, and per-key usage."""
-    sqlite_stats = await sqlite_logger.get_analytics()
-    return sqlite_stats
+    return await sqlite_logger.get_stats()
 
 
 @app.get("/metrics")

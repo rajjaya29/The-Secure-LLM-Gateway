@@ -1,4 +1,4 @@
-"""ChromaDB Vector Store implementation for semantic cache storage and cosine similarity retrieval."""
+"""ChromaDB Vector Store with Tenant / API-Key Isolation."""
 
 import json
 import time
@@ -7,13 +7,13 @@ import threading
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
 import chromadb
-from chromadb.config import Settings as ChromaSettings
+from app.config import settings
 
 
 class ChromaVectorStore:
     """
-    Local Vector-Based Semantic Cache using ChromaDB with cosine distance metric ('hnsw:space': 'cosine').
-    Matches queries against previous query embeddings (all-MiniLM-L6-v2) at cosine similarity >= 0.90.
+    Local Vector-Based Semantic Cache backed by ChromaDB with cosine distance metric.
+    Features strict API-Key / Tenant Isolation to prevent cross-client cache leakage.
     """
 
     def __init__(
@@ -21,27 +21,28 @@ class ChromaVectorStore:
         collection_name: str = "semantic_cache",
         persist_directory: Optional[str] = None,
         max_entries: int = 10000,
+        isolate_by_api_key: bool = True,
     ):
         self.collection_name = collection_name
         self.max_entries = max_entries
+        self.isolate_by_api_key = isolate_by_api_key
         self._exact_hash_index: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
 
-        # Initialize ChromaDB Client
         if persist_directory:
             self._client = chromadb.PersistentClient(path=persist_directory)
         else:
             self._client = chromadb.Client()
 
-        # Create or get ChromaDB collection with cosine distance
         self._collection = self._client.get_or_create_collection(
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"},
         )
 
-    def _hash_key(self, prompt: str, model: str, system_hash: str) -> str:
+    def _hash_key(self, prompt: str, model: str, api_key_hash: str, system_hash: str) -> str:
         import hashlib
-        return hashlib.sha256(f"{model}:{system_hash}:{prompt.strip()}".encode()).hexdigest()
+        key_scope = api_key_hash if self.isolate_by_api_key else "global"
+        return hashlib.sha256(f"{key_scope}:{model}:{system_hash}:{prompt.strip()}".encode()).hexdigest()
 
     def upsert(
         self,
@@ -49,19 +50,21 @@ class ChromaVectorStore:
         embedding: np.ndarray,
         response_payload: Dict[str, Any],
         model: str,
+        api_key_hash: str = "key_default",
         system_hash: str = "default",
         ttl_seconds: int = 86400,
         token_count: int = 0,
     ) -> str:
-        """Indexes prompt embedding and response payload into ChromaDB."""
+        """Indexes prompt vector, payload, and client metadata into ChromaDB."""
         with self._lock:
             doc_id = f"chroma-{uuid.uuid4().hex[:12]}"
             created_at = time.time()
             expires_at = created_at + ttl_seconds
-            
-            # Prepare metadata for ChromaDB (scalars only)
+            key_scope = api_key_hash if self.isolate_by_api_key else "global"
+
             metadata = {
                 "model": model,
+                "api_key_hash": key_scope,
                 "system_hash": system_hash,
                 "created_at": created_at,
                 "expires_at": expires_at,
@@ -69,7 +72,6 @@ class ChromaVectorStore:
                 "response_json": json.dumps(response_payload),
             }
 
-            # Upsert into ChromaDB collection
             self._collection.upsert(
                 ids=[doc_id],
                 embeddings=[embedding.tolist() if isinstance(embedding, np.ndarray) else embedding],
@@ -77,23 +79,31 @@ class ChromaVectorStore:
                 metadatas=[metadata],
             )
 
-            # Store in exact match hash index for sub-millisecond shortcut
-            exact_key = self._hash_key(prompt, model, system_hash)
+            # Record in exact match index
+            exact_key = self._hash_key(prompt, model, api_key_hash, system_hash)
             self._exact_hash_index[exact_key] = {
                 "id": doc_id,
                 "prompt": prompt,
                 "response_payload": response_payload,
                 "model": model,
+                "api_key_hash": key_scope,
                 "system_hash": system_hash,
                 "expires_at": expires_at,
+                "token_count": token_count,
             }
 
             return doc_id
 
-    def get_by_exact_match(self, prompt: str, model: str, system_hash: str = "default") -> Optional[Dict[str, Any]]:
-        """Sub-millisecond exact match hash lookup."""
+    def get_by_exact_match(
+        self,
+        prompt: str,
+        model: str,
+        api_key_hash: str = "key_default",
+        system_hash: str = "default",
+    ) -> Optional[Dict[str, Any]]:
+        """Fast-path exact match hash lookup with tenant isolation."""
         with self._lock:
-            exact_key = self._hash_key(prompt, model, system_hash)
+            exact_key = self._hash_key(prompt, model, api_key_hash, system_hash)
             item = self._exact_hash_index.get(exact_key)
             if not item:
                 return None
@@ -108,13 +118,14 @@ class ChromaVectorStore:
         self,
         query_vector: np.ndarray,
         model: str,
+        api_key_hash: str = "key_default",
         system_hash: str = "default",
         threshold: float = 0.90,
         limit: int = 1,
     ) -> List[Tuple[Dict[str, Any], float]]:
         """
-        Queries ChromaDB using cosine distance.
-        Converts cosine distance d to cosine similarity s = 1.0 - d.
+        Searches ChromaDB using cosine distance with client partition filtering.
+        Calculates cosine similarity s = 1.0 - distance.
         Returns matches where similarity >= threshold.
         """
         with self._lock:
@@ -122,19 +133,28 @@ class ChromaVectorStore:
                 return []
 
             vec_list = query_vector.tolist() if isinstance(query_vector, np.ndarray) else query_vector
+            key_scope = api_key_hash if self.isolate_by_api_key else "global"
 
-            # Query ChromaDB
+            # Filter by model and api_key_hash for tenant isolation
+            where_clause = None
+            if self._collection.count() > 1:
+                where_clause = {
+                    "$and": [
+                        {"model": model},
+                        {"api_key_hash": key_scope},
+                    ]
+                }
+
             try:
                 query_res = self._collection.query(
                     query_embeddings=[vec_list],
-                    n_results=min(limit * 3, max(1, self._collection.count())),
-                    where={"$and": [{"model": model}, {"system_hash": system_hash}]} if self._collection.count() > 1 else None,
+                    n_results=min(limit * 4, max(1, self._collection.count())),
+                    where=where_clause,
                 )
             except Exception:
-                # Fallback if where filter unsupported in single-doc collections
                 query_res = self._collection.query(
                     query_embeddings=[vec_list],
-                    n_results=min(limit * 3, max(1, self._collection.count())),
+                    n_results=min(limit * 4, max(1, self._collection.count())),
                 )
 
             results: List[Tuple[Dict[str, Any], float]] = []
@@ -148,16 +168,14 @@ class ChromaVectorStore:
 
                 for idx, doc_id in enumerate(ids):
                     dist = distances[idx] if idx < len(distances) else 1.0
-                    # Cosine distance to similarity: sim = 1.0 - distance
                     sim = round(float(1.0 - dist), 4)
 
                     meta = metadatas[idx] if idx < len(metadatas) else {}
                     doc_text = documents[idx] if idx < len(documents) else ""
 
-                    # Check expiration & context isolation
                     if meta.get("expires_at", 0) <= now:
                         continue
-                    if meta.get("model") != model or meta.get("system_hash") != system_hash:
+                    if meta.get("model") != model or (self.isolate_by_api_key and meta.get("api_key_hash") != key_scope):
                         continue
 
                     if sim >= threshold:
@@ -167,12 +185,12 @@ class ChromaVectorStore:
                             "prompt": doc_text,
                             "response_payload": resp_payload,
                             "model": model,
+                            "api_key_hash": key_scope,
                             "system_hash": system_hash,
                             "token_count": meta.get("token_count", 0),
                         }
                         results.append((item_dict, sim))
 
-            # Sort by highest similarity
             results.sort(key=lambda x: x[1], reverse=True)
             return results[:limit]
 

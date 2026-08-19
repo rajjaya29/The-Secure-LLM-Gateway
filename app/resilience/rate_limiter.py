@@ -1,15 +1,20 @@
-"""In-Memory Sliding-Window Rate Limiter per API key."""
+"""In-Memory Sliding-Window Rate Limiter per API Key.
+
+NOTE: This rate limiter is process-local / in-memory. It manages rate-limiting
+quotas on a single gateway instance using an efficient collections.deque
+timestamp window per API key identifier.
+"""
 
 import time
 import threading
 from collections import deque
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 
 
 class SlidingWindowRateLimiter:
     """
     In-memory sliding-window rate limiter.
-    Tracks exact request timestamps in a sliding time window (e.g. 60 requests per 60s) per API key.
+    Maintains a rolling timestamp window for each API key identity.
     """
 
     def __init__(
@@ -24,52 +29,56 @@ class SlidingWindowRateLimiter:
         self._windows: Dict[str, deque] = {}
         self._lock = threading.Lock()
 
-    def check_limit(self, client_id: str) -> Tuple[bool, float]:
+    def check_limit(self, key_id: str) -> Tuple[bool, float, int]:
         """
-        Evaluates if request from client_id is within the sliding window quota.
+        Checks if the request from key_id is permitted under the sliding window.
         Returns:
-            - allowed (bool)
-            - retry_after_seconds (float)
+            - allowed (bool): True if allowed, False if exceeded.
+            - retry_after (float): Seconds until the oldest request leaves the window.
+            - remaining (int): Remaining requests allowed in the current window.
         """
         if not self.enabled:
-            return True, 0.0
+            return True, 0.0, self.max_requests
 
         now = time.time()
         window_start = now - self.window_seconds
 
         with self._lock:
-            if client_id not in self._windows:
-                self._windows[client_id] = deque()
+            if key_id not in self._windows:
+                self._windows[key_id] = deque()
 
-            req_deque = self._windows[client_id]
+            req_deque = self._windows[key_id]
 
-            # Evict timestamps outside current sliding window
+            # 1. Evict timestamps older than the sliding window boundary
             while req_deque and req_deque[0] <= window_start:
                 req_deque.popleft()
 
-            # Check if threshold reached
-            if len(req_deque) >= self.max_requests:
-                oldest_in_window = req_deque[0]
-                retry_after = max(0.1, (oldest_in_window + self.window_seconds) - now)
-                return False, round(retry_after, 2)
+            current_count = len(req_deque)
 
-            # Record current request timestamp
+            # 2. Check if the threshold is exceeded
+            if current_count >= self.max_requests:
+                oldest_timestamp = req_deque[0]
+                retry_after = max(0.1, (oldest_timestamp + self.window_seconds) - now)
+                return False, round(retry_after, 2), 0
+
+            # 3. Record new timestamp
             req_deque.append(now)
-            return True, 0.0
+            remaining = self.max_requests - len(req_deque)
+            return True, 0.0, remaining
 
-    def get_client_usage(self, client_id: str) -> int:
-        """Returns active request count in current sliding window for client."""
+    def get_remaining(self, key_id: str) -> int:
+        """Returns the remaining request quota in the active sliding window."""
         now = time.time()
         window_start = now - self.window_seconds
         with self._lock:
-            req_deque = self._windows.get(client_id)
+            req_deque = self._windows.get(key_id)
             if not req_deque:
-                return 0
-            # Clean expired
+                return self.max_requests
             while req_deque and req_deque[0] <= window_start:
                 req_deque.popleft()
-            return len(req_deque)
+            return max(0, self.max_requests - len(req_deque))
 
     def clear(self):
+        """Clears all rate-limiting state."""
         with self._lock:
             self._windows.clear()

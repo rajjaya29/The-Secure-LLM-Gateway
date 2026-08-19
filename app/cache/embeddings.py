@@ -1,86 +1,105 @@
-"""Vector embedding engine using all-MiniLM-L6-v2 embeddings."""
+"""Vector embedding engine using SentenceTransformers with all-MiniLM-L6-v2."""
 
-import os
+import logging
 import hashlib
 import numpy as np
-from typing import List, Union, Optional
-import logging
+from typing import List, Optional
+from app.config import settings
 
 logger = logging.getLogger("secure_gateway.embeddings")
+
+_GLOBAL_SENTENCE_TRANSFORMER = None
+
+
+def get_sentence_transformer(model_name: str = "all-MiniLM-L6-v2"):
+    """Singleton model loader for SentenceTransformer to prevent redundant downloads."""
+    global _GLOBAL_SENTENCE_TRANSFORMER
+    if _GLOBAL_SENTENCE_TRANSFORMER is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            logger.info(f"Loading SentenceTransformer model '{model_name}'...")
+            _GLOBAL_SENTENCE_TRANSFORMER = SentenceTransformer(model_name)
+            logger.info(f"SentenceTransformer '{model_name}' loaded successfully.")
+        except Exception as e:
+            logger.warning(f"Could not load SentenceTransformer directly: {e}. Falling back to FastEmbed/native.")
+    return _GLOBAL_SENTENCE_TRANSFORMER
 
 
 class EmbeddingEngine:
     """
-    High-speed embedding generator for all-MiniLM-L6-v2.
+    Embedding generator using Sentence Transformers (all-MiniLM-L6-v2).
     Produces unit-normalized 384-dimensional dense vectors for cosine similarity computation.
     """
 
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", vector_dim: int = 384):
-        self.model_name = model_name
+    def __init__(self, model_name: Optional[str] = None, vector_dim: int = 384):
+        self.model_name = model_name or settings.EMBEDDING_MODEL
         self.vector_dim = vector_dim
+        self._st_model = None
         self._fastembed_model = None
-        self._use_fastembed = False
-        
-        self._init_model()
+        self._initialized = False
 
-    def _init_model(self):
+    def _ensure_initialized(self):
+        if self._initialized:
+            return
+        self._st_model = get_sentence_transformer(self.model_name)
+        if self._st_model is None:
+            self._init_fastembed_fallback()
+        self._initialized = True
+
+    def _init_fastembed_fallback(self):
         try:
             from fastembed import TextEmbedding
-            # Fastembed supports all-MiniLM-L6-v2 / BAAI models
-            try:
-                self._fastembed_model = TextEmbedding(model_name=self.model_name)
-            except Exception:
-                self._fastembed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-            
-            list(self._fastembed_model.embed(["warmup query"]))
-            self._use_fastembed = True
-            logger.info("all-MiniLM-L6-v2 embedding model loaded successfully.")
-        except Exception as e:
-            logger.warning(f"FastEmbed notice: {e}. Utilizing native all-MiniLM-L6-v2 dense projector.")
-            self._use_fastembed = False
+            self._fastembed_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            list(self._fastembed_model.embed(["warmup"]))
+        except Exception:
+            self._fastembed_model = None
 
     def embed_query(self, text: str) -> np.ndarray:
+        """Encodes a single text prompt into a 384-dim normalized vector."""
         if not text:
             return np.zeros(self.vector_dim, dtype=np.float32)
 
-        if self._use_fastembed and self._fastembed_model:
-            try:
-                embeddings = list(self._fastembed_model.embed([text]))
-                vec = np.array(embeddings[0], dtype=np.float32)
-                norm = np.linalg.norm(vec)
-                if norm > 0:
-                    vec = vec / norm
-                return vec
-            except Exception as ex:
-                logger.error(f"FastEmbed embedding error: {ex}, falling back to native projector")
+        self._ensure_initialized()
 
+        # 1. Primary: SentenceTransformers
+        if self._st_model is not None:
+            try:
+                emb = self._st_model.encode(text, normalize_embeddings=True)
+                return np.array(emb, dtype=np.float32)
+            except Exception as e:
+                logger.error(f"SentenceTransformers encode error: {e}")
+
+        # 2. Secondary: FastEmbed
+        if self._fastembed_model is not None:
+            try:
+                embs = list(self._fastembed_model.embed([text]))
+                v = np.array(embs[0], dtype=np.float32)
+                norm = np.linalg.norm(v)
+                return v / norm if norm > 0 else v
+            except Exception as e:
+                logger.error(f"FastEmbed fallback error: {e}")
+
+        # 3. Deterministic native subword projection (zero external network dependency)
         return self._native_embed(text)
 
     def embed_batch(self, texts: List[str]) -> List[np.ndarray]:
+        """Batch encodes multiple text strings."""
         if not texts:
             return []
 
-        if self._use_fastembed and self._fastembed_model:
+        if self._st_model is not None:
             try:
-                embeddings = list(self._fastembed_model.embed(texts))
-                result = []
-                for emb in embeddings:
-                    vec = np.array(emb, dtype=np.float32)
-                    norm = np.linalg.norm(vec)
-                    if norm > 0:
-                        vec = vec / norm
-                    result.append(vec)
-                return result
-            except Exception as ex:
-                logger.error(f"FastEmbed batch embedding error: {ex}, falling back")
+                embs = self._st_model.encode(texts, normalize_embeddings=True)
+                return [np.array(e, dtype=np.float32) for e in embs]
+            except Exception:
+                pass
 
-        return [self._native_embed(t) for t in texts]
+        return [self.embed_query(t) for t in texts]
 
     def _native_embed(self, text: str) -> np.ndarray:
         vec = np.zeros(self.vector_dim, dtype=np.float32)
         clean_text = text.lower().strip()
         tokens = clean_text.split()
-        
         ngrams = []
         for token in tokens:
             ngrams.append(token)

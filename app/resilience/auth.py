@@ -1,25 +1,35 @@
 """API-Key Authentication Middleware and Dependency for The Secure LLM Gateway."""
 
-from typing import Optional
-from fastapi import Header, HTTPException, Request, Security
-from fastapi.security.api_key import APIKeyHeader
+import hashlib
+from typing import Optional, Tuple
+from fastapi import Header, HTTPException, Request
 from app.config import settings
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def hash_api_key(api_key: str) -> str:
+    """
+    Generates a secure, deterministic one-way hash identifier for an API key.
+    Raw keys are NEVER stored in SQLite logs or database tables.
+    """
+    if not api_key:
+        return "key_anonymous"
+    h = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+    return f"key_{h}"
 
 
 async def verify_api_key(
     request: Request,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-) -> str:
+) -> Tuple[str, str]:
     """
-    Validates API key provided in the X-API-Key header (or Bearer Authorization fallback).
-    Returns the authenticated API key identifier.
+    Validates the X-API-Key header (or Authorization: Bearer fallback).
+    Returns a tuple of (raw_key, api_key_hash).
+    Raises HTTP 401 if missing or invalid.
     """
     if not settings.REQUIRE_API_KEY:
-        return x_api_key or "anonymous"
+        raw_key = x_api_key or "anonymous"
+        return raw_key, hash_api_key(raw_key)
 
-    # Check X-API-Key header
     key = x_api_key
 
     # Check Bearer authorization fallback
@@ -35,14 +45,14 @@ async def verify_api_key(
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    # Validate against configured keys or allow validly formatted keys (sk-...)
+    # Validate against configured list of keys or valid key formats
     if settings.VALID_API_KEYS and key not in settings.VALID_API_KEYS:
-        # If not explicitly in the static list, accept valid prefix keys for flexibility if configured
-        if not key.startswith("sk-") and not key.startswith("gw-"):
+        if not key.startswith("sk-") and not key.startswith("demo-"):
             raise HTTPException(
                 status_code=401,
                 detail="Invalid API Key. Access denied.",
                 headers={"WWW-Authenticate": "ApiKey"},
             )
 
-    return key
+    key_hash = hash_api_key(key)
+    return key, key_hash
