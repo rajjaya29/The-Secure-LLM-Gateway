@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The Secure LLM Gateway | Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="brand-icon">🛡️</div>
+        <div>
+          <h1>The Secure LLM Gateway</h1>
+          <p>Semantic Vector Caching • Input/Output Guardrails • Resilient Fallback Routing • Prometheus Observability</p>
+        </div>
+      </div>
+      <div class="header-badges">
+        <div class="badge">
+          <div class="badge-dot"></div>
+          <span>Gateway Active (v1.0)</span>
+        </div>
+        <div class="badge">
+          <a href="/metrics" target="_blank" style="color: var(--accent-cyan); text-decoration: none;">📊 /metrics</a>
+        </div>
+      </div>
+    </header>
+
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-title">Cache Hit Ratio</div>
+        <div class="metric-val" id="metric-hit-ratio">0.0%</div>
+        <div class="metric-sub" id="metric-hits-misses">0 Hits / 0 Misses</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Cached vs Upstream Latency</div>
+        <div class="metric-val" style="color: var(--accent-emerald);" id="metric-cached-lat">-- ms</div>
+        <div class="metric-sub" id="metric-upstream-lat">Upstream: -- ms</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Injections Blocked</div>
+        <div class="metric-val" style="color: var(--accent-rose);" id="metric-injections">0</div>
+        <div class="metric-sub">Malicious inputs intercepted</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">PII Entities Scrubbed</div>
+        <div class="metric-val" style="color: var(--accent-amber);" id="metric-pii">0</div>
+        <div class="metric-sub">Sensitive data masked</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-title">Tokens Saved</div>
+        <div class="metric-val" style="color: var(--accent-cyan);" id="metric-tokens">0</div>
+        <div class="metric-sub">Zero-cost cached inference</div>
+      </div>
+    </div>
+
+    <div class="main-layout">
+      <div>
+        <div class="section-box">
+          <h2>⚡ Live Gateway Playground</h2>
+          
+          <div class="presets-container">
+            <button class="preset-btn" onclick="applyPreset('france_1')">📌 1. Query: Capital of France</button>
+            <button class="preset-btn" onclick="applyPreset('france_2')">⚡ 2. Paraphrase (Semantic Hit)</button>
+            <button class="preset-btn" onclick="applyPreset('injection')">🚨 3. Injection / Jailbreak Attack</button>
+            <button class="preset-btn" onclick="applyPreset('pii')">🔒 4. PII Data Scrubbing</button>
+            <button class="preset-btn" onclick="applyPreset('python')">💻 5. Python Code Query</button>
+          </div>
+
+          <div class="form-group">
+            <div class="form-label">
+              <span>Input Prompt Payload</span>
+              <span id="char-count" style="font-size: 11px; color: var(--text-muted);">0 chars</span>
+            </div>
+            <textarea id="prompt-input" class="input-box" placeholder="Enter a prompt to test semantic caching, guardrails, and routing...">What is the capital of France?</textarea>
+          </div>
+
+          <div class="controls-row">
+            <div class="slider-container">
+              <div class="form-label">
+                <span>Similarity Threshold</span>
+                <span id="threshold-val" style="color: var(--accent-cyan); font-weight: bold;">0.92</span>
+              </div>
+              <input type="range" id="threshold-slider" min="0.50" max="0.99" step="0.01" value="0.92" oninput="updateThreshold(this.value)">
+            </div>
+            <div class="slider-container">
+              <div class="form-label">
+                <span>Target Model</span>
+              </div>
+              <select id="model-select" style="width: 100%; padding: 6px; background: #0b0f19; border: 1px solid var(--border-color); color: #fff; border-radius: 6px;">
+                <option value="gpt-4o-mini" selected>gpt-4o-mini (Default)</option>
+                <option value="gpt-4o">gpt-4o</option>
+                <option value="claude-3-5-sonnet">claude-3-5-sonnet</option>
+                <option value="llama3">llama3 (Ollama)</option>
+                <option value="mock-llm">mock-llm (Fast Emulator)</option>
+              </select>
+            </div>
+          </div>
+
+          <button id="send-btn" class="btn-primary" onclick="sendPrompt()">
+            <span>🚀 Send Through Secure Gateway</span>
+          </button>
+
+          <div id="result-container" class="result-card" style="display: none;">
+            <div class="result-header">
+              <span style="font-size: 13px; font-weight: 700; color: var(--text-secondary);">Gateway Telemetry & Response</span>
+              <div class="telemetry-pills" id="telemetry-pills"></div>
+            </div>
+
+            <div id="guardrail-alert-box"></div>
+            <div class="result-body" id="result-body"></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="section-box">
+          <h2>🛡️ Security & Privacy Inspector</h2>
+          <div id="guardrail-inspector-details">
+            <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 12px;">
+              Input security validates queries against prompt injection signatures, delimiter spoofing, and strips sensitive PII before forwarding upstream.
+            </p>
+            <div id="pii-breakdown" style="font-size: 13px; color: var(--text-muted);">
+              • No active threats detected yet. Send a test query to inspect.
+            </div>
+          </div>
+        </div>
+
+        <div class="section-box">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+            <h2 style="margin-bottom: 0;">🌐 Providers & Circuit Breakers</h2>
+            <button onclick="fetchStats()" style="background: transparent; border: 1px solid var(--border-color); color: var(--text-secondary); padding: 4px 8px; border-radius: 6px; font-size: 11px; cursor: pointer;">🔄 Refresh</button>
+          </div>
+          <div class="providers-grid" id="providers-grid">
+          </div>
+        </div>
+
+        <div class="section-box">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+              <h2 style="margin-bottom: 2px;">📦 Semantic Cache</h2>
+              <span id="cache-size-label" style="font-size: 12px; color: var(--text-muted);">0 entries indexed</span>
+            </div>
+            <button onclick="clearCache()" style="background: rgba(244, 63, 94, 0.2); border: 1px solid rgba(244, 63, 94, 0.4); color: var(--accent-rose); padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer;">Clear Cache</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
