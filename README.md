@@ -1,53 +1,119 @@
 # 🛡️ The Secure LLM Gateway
+### *High-Performance Semantic Caching, Guardrails & LLM Reverse-Proxy*
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg?style=flat&logo=fastapi)](https://fastapi.tiangolo.com)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat&logo=python)](https://www.python.org/)
 [![Sentence-Transformers](https://img.shields.io/badge/Embeddings-all--MiniLM--L6--v2-yellow.svg?style=flat)](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
 [![ChromaDB](https://img.shields.io/badge/Vector_DB-ChromaDB-FF6B6B.svg?style=flat)](https://www.trychroma.com/)
 [![SQLite](https://img.shields.io/badge/Audit-SQLite_3-003B57.svg?style=flat&logo=sqlite)](https://www.sqlite.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Tests Passing](https://img.shields.io/badge/pytest-16%20passed%20(100%25)-brightgreen.svg?style=flat)](tests/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-An authenticated, rate-limited LLM reverse-proxy and security gateway built in FastAPI to manage prompt routing, reduce redundant upstream API calls through **ChromaDB Semantic Caching ($\ge 0.90$ Cosine Similarity with `all-MiniLM-L6-v2`)**, enforce **API-Key Authentication (`X-API-Key`)**, apply **In-Memory Sliding-Window Rate Limiting**, execute **Prompt Validation Guardrails**, and track live analytics via **Structured SQLite Request Logging** and the **`/stats`** endpoint.
-
----
-
-## 📋 Resume Implementation Summary
-
-* **Authenticated, Rate-Limited LLM API Proxy**: Engineered an asynchronous LLM reverse-proxy in FastAPI to handle prompt routing and reduce redundant upstream API calls.
-* **Local Vector-Based Semantic Caching**: Implemented local vector-based semantic caching using `all-MiniLM-L6-v2` embeddings and ChromaDB (cosine similarity $\ge 0.90$), cutting response latency from **~980ms to <25ms** on cached query hits and reducing token costs by over 40%.
-* **Custom Security Middleware**: Developed custom middleware for API-key authentication (`X-API-Key`), in-memory sliding-window rate limiting (60 req/60s per key), and active prompt validation intercepting malicious injection patterns.
-* **Structured SQLite Request Logging & `/stats`**: Integrated structured SQLite request logging and built a `/stats` metrics endpoint to track live cache-hit ratios, latency distributions (P50, P95, P99), and per-API-key usage.
+An authenticated, rate-limited LLM API proxy built with **FastAPI**, **Sentence-Transformers (`all-MiniLM-L6-v2`)**, **ChromaDB**, and **SQLite**. Designed to eliminate redundant upstream model calls through **sub-25ms vector semantic caching ($\ge 0.90$ similarity)**, enforce **sliding-window rate limiting**, validate prompts against adversarial jailbreaks, and provide real-time **per-key observability**.
 
 ---
 
-## 🌟 Target Architecture & Request Flow
+## 📑 Table of Contents
+- [Executive Overview](#-executive-overview)
+- [System Architecture](#-system-architecture)
+- [Key Features](#-key-features)
+- [Performance Benchmarks](#-performance-benchmarks)
+- [Quickstart Guide](#-quickstart-guide)
+- [API Reference](#-api-reference)
+- [Repository Structure](#-repository-structure)
+- [Automated Testing](#-automated-testing)
+- [Security & Tenant Isolation](#-security--tenant-isolation)
+- [Docker Deployment](#-docker-deployment)
+
+---
+
+## 🎯 Executive Overview
+
+| Technical Capability | Implementation Details | Verified Metric / SLA |
+| :--- | :--- | :--- |
+| **LLM Proxy & Routing** | Asynchronous reverse-proxy handling OpenAI-compatible chat requests | Multi-provider fallback (OpenAI, Anthropic, Ollama, Mock) |
+| **API-Key Authentication** | Custom dependency validating `X-API-Key` headers | Rejects unauthorized requests with `HTTP 401` |
+| **Sliding-Window Rate Limiting** | Process-local in-memory `collections.deque` per API key | Enforces quotas (60 req/60s) with `HTTP 429` & `Retry-After` |
+| **Prompt Validation** | Heuristic & pattern filtering for overrides, jailbreaks, and exfiltrations | Blocks attacks with `HTTP 400 Bad Request` |
+| **Semantic Vector Cache** | ChromaDB with `all-MiniLM-L6-v2` dense embeddings ($\ge 0.90$ Cosine Sim) | Cuts latency from **~1038ms to 15.0ms (69.2x speedup)** |
+| **Structured Request Logging** | Asynchronous SQLite repository logging hashed client identifiers | `gateway_logs.db` auditing all transactions safely |
+| **Live Telemetry & `/stats`** | Dynamic analytical endpoint tracking hit ratios, percentiles & key usage | Live P50, P95, P99 percentiles & per-key analytics |
+
+---
+
+## 🌟 System Architecture
 
 ```
-Client Request (X-API-Key Header)
-      │
-      ▼
-[ FastAPI Gateway / Proxy ]
-      │
-      ├── 1. API-Key Authentication: Validate X-API-Key (HTTP 401 on missing/invalid)
-      │
-      ├── 2. Sliding-Window Rate Limiting: In-memory rolling timestamp window (HTTP 429 on quota exceeded)
-      │
-      ├── 3. Prompt Validation: Detect instruction overrides, jailbreaks, delimiter spoofing (HTTP 400)
-      │
-      ├── 4. Semantic Cache Lookup: Query ChromaDB with all-MiniLM-L6-v2 embeddings (Tenant Isolated)
-      │        ├── Cache Hit (cosine similarity >= 0.90) ──► Return cached response (<25ms)
-      │        └── Cache Miss ───────────────────────────► Continue to Step 5
-      │
-      ├── 5. Upstream Provider Routing: Call OpenAI / Anthropic / Ollama / Mock Provider (~980ms)
-      │
-      └── 6. Output Guardrail & Storage: Verify response, async ChromaDB cache write, structured SQLite audit log
+                                 CLIENT REQUEST
+                         (Headers: X-API-Key: demo-key)
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       FASTAPI GATEWAY ENGINE                                │
+│                                                                             │
+│  [ Step 1: Authentication ] ──► Validate X-API-Key (HTTP 401 if invalid)    │
+│  [ Step 2: Rate Limiting ]  ──► Sliding-Window Quota Check (HTTP 429)       │
+│  [ Step 3: Validation ]     ──► Prompt Injection & Jailbreak Check (HTTP 400)│
+│                                      │                                      │
+│  [ Step 4: Semantic Cache ] ─────────┴────────────────────────────────────┐ │
+│       ├── Generate query embedding using all-MiniLM-L6-v2                 │ │
+│       └── Query ChromaDB collection with Cosine Similarity >= 0.90        │ │
+│                                                                           │ │
+│       ┌───────────────────────┬────────────────────────┐                  │ │
+│       │ Cache HIT (>= 0.90)   │ Cache MISS (< 0.90)    │                  │ │
+│       ▼                       ▼                        │                  │ │
+│  Return Cached Response  Route to Upstream Provider   │                  │ │
+│  (⚡ Latency: < 25ms)     (📡 Latency: ~980ms)          │                  │ │
+│                               │                        │                  │ │
+│                               ├── Write to ChromaDB    │                  │ │
+│                               └── Log to SQLite DB     │                  │ │
+└───────────────────────────────────────┬────────────────┴──────────────────┘
+                                        │
+                                        ▼
+                               CLIENT RESPONSE
+                      (Headers: X-Cache-Status: HIT/MISS)
 ```
 
 ---
 
-## ⚡ Real Measured Benchmark Performance
+## 🔑 Key Features
 
-The benchmark script measures real latencies using monotonic clock timers (`time.perf_counter()`):
+### 1. 🔐 API-Key Authentication (`X-API-Key`)
+* Validates client access tokens via the `X-API-Key` header (with `Bearer` token fallback).
+* Computes deterministic SHA-256 digests (`key_<hash>`) for database storage and tenant isolation.
+* **Zero-Secret Leakage**: Raw API keys are strictly forbidden from database logs.
+
+### 2. ⏱️ In-Memory Sliding-Window Rate Limiting
+* Implements a rolling timestamp deque (`collections.deque`) per authenticated API key.
+* Independently manages burst quotas (default: `60 requests / 60 seconds`).
+* Provides HTTP standard response headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`).
+
+### 3. 🛡️ Prompt Validation & Security Filter
+* Real-time inspection intercepting:
+  * **Instruction Overrides**: `"ignore all previous instructions"`, `"disregard prior directives"`
+  * **Persona Jailbreaks**: `"DAN mode"`, `"Developer mode"`, `"unaligned AI"`
+  * **Delimiter Spoofing**: `<|im_start|>system`, `<<SYS>>`, `### System:`
+  * **Context Exfiltration**: `"reveal system prompt"`, `"repeat words verbatim"`
+
+### 4. ⚡ ChromaDB Semantic Cache (`all-MiniLM-L6-v2`)
+* Local vector cache converting queries into 384-dimensional unit-normalized embeddings.
+* Configured with cosine distance metric (`{"hnsw:space": "cosine"}`).
+* Matches semantically equivalent and paraphrased queries at $\text{Similarity} \ge 0.90$.
+* **Tenant Partitioning**: Enforces metadata filters so client keys cannot access other tenants' cached responses.
+
+### 5. 📊 SQLite Audit Logging & `/stats` Analytics
+* Asynchronously records each transaction to `gateway_logs.db`.
+* **`GET /stats` Endpoint**: Delivers live aggregations including:
+  * Overall request counts, cache hits, and cache hit ratios
+  * Upstream calls and upstream calls avoided
+  * Latency distributions: **P50, P95, and P99**
+  * Per-API-key usage breakdowns (requests, cache hits, token volume, error counts).
+
+---
+
+## ⚡ Performance Benchmarks
+
+All benchmark metrics are recorded using high-precision monotonic clock timers (`time.perf_counter()`):
 
 ```
 ==================================================
@@ -65,13 +131,13 @@ Upstream calls: 16
 Upstream calls avoided: 6
 
 CACHE HIT LATENCY
-Average: 15.00 ms   (<25ms Target Met!)
-P50:     18.03 ms   (<25ms Target Met!)
-P95:     19.62 ms   (<25ms Target Met!)
-P99:     19.62 ms   (<25ms Target Met!)
+Average: 15.00 ms   (< 25ms SLA Target Met)
+P50:     18.03 ms   (< 25ms SLA Target Met)
+P95:     19.62 ms   (< 25ms SLA Target Met)
+P99:     19.62 ms   (< 25ms SLA Target Met)
 
 CACHE MISS LATENCY
-Average: 1038.12 ms (~980ms Baseline)
+Average: 1038.12 ms (~980ms Simulated Baseline)
 P50:     1007.45 ms
 P95:     1151.51 ms
 P99:     1167.93 ms
@@ -81,56 +147,34 @@ Speedup: 69.2x
 ==================================================
 ```
 
----
+### 📊 Latency Comparison
 
-## 🔑 Core Features & Components
-
-### 1. API-Key Authentication (`X-API-Key`)
-* Rejects missing or invalid API keys with `HTTP 401 Unauthorized`.
-* Validates keys against configured environment variables or registered client keys.
-* **Security Design**: Generates secure SHA-256 hash identifiers (`key_<hash>`) for database logging and tenant cache isolation. **Raw API keys are NEVER logged to SQLite**.
-
-### 2. In-Memory Sliding-Window Rate Limiting
-* Employs an efficient `collections.deque` rolling timestamp window for each API key identity.
-* Configurable limit: `RATE_LIMIT_REQUESTS=60`, `RATE_LIMIT_WINDOW_SECONDS=60`.
-* Rejects requests exceeding limits with `HTTP 429 Too Many Requests` and a dynamic `Retry-After` header.
-* *Note: Process-local and in-memory, designed for single gateway nodes.*
-
-### 3. Prompt Validation Component
-* Inspects user prompts to intercept adversarial jailbreak patterns:
-  * Direct instruction overrides ("ignore all previous instructions", "disregard prior directives")
-  * Persona jailbreaks ("DAN mode", "Developer mode", "unaligned AI")
-  * Delimiter spoofing (`<|im_start|>system`, `<<SYS>>`, `### System:`)
-  * Context exfiltration ("reveal system prompt", "repeat words verbatim")
-* Blocks malicious prompts with `HTTP 400 Bad Request` and structured JSON threat details.
-
-### 4. Sentence-Transformers & ChromaDB Semantic Cache
-* **Embedding Model**: `sentence-transformers/all-MiniLM-L6-v2` loaded once at application startup.
-* **Vector Store**: Local ChromaDB instance with cosine distance space (`{"hnsw:space": "cosine"}`).
-* **Similarity Threshold**: $\text{Cosine Similarity} \ge 0.90$.
-* **Tenant Isolation**: Cache lookups are partitioned by `api_key_hash` so different API keys cannot inspect each other's cached query responses.
-
-### 5. Structured SQLite Logging & `/stats` Endpoint
-* Asynchronously records every request into `request_logs` in `gateway_logs.db`.
-* Schema includes: `request_id`, `timestamp`, `api_key_hash`, `model`, `prompt_length`, `response_length`, `latency_ms`, `cache_hit`, `similarity`, `provider`, `status_code`, `error`.
-* **`GET /stats`**: Computes live request aggregates, cache-hit ratio, upstream calls avoided, latency distributions (P50, P95, P99), and per-API-key usage breakdowns.
+| Metric | Cold Request (Cache MISS) | Cached Query (Cache HIT) | Speedup / Improvement |
+| :--- | :--- | :--- | :--- |
+| **Average Latency** | `1038.12 ms` | **`15.00 ms`** | **69.2x faster** |
+| **P50 Latency** | `1007.45 ms` | **`18.03 ms`** | **55.8x faster** |
+| **P95 Latency** | `1151.51 ms` | **`19.62 ms`** | **58.6x faster** |
+| **SLA Target Compliance** | Baseline | **100% (< 25ms)** | ✅ Target Achieved |
 
 ---
 
-## 🛠️ Local Installation & Quickstart
+## 🛠️ Quickstart Guide
 
-### 1. Clone & Setup Virtual Environment
+### 1. Clone & Setup Environment
 ```bash
 git clone https://github.com/rajjaya29/The-Secure-LLM-Gateway.git
 cd The-Secure-LLM-Gateway
 
+# Create virtual environment
 python -m venv .venv
 source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment Variables
-Create a `.env` file (or copy `.env.example`):
+### 2. Environment Configuration
+Create a `.env` file in the root directory:
 ```env
 HOST=0.0.0.0
 PORT=8000
@@ -145,39 +189,73 @@ DEFAULT_PROVIDER=mock
 MOCK_LLM_LATENCY_MS=980.0
 ```
 
-### 3. Start the Gateway
+### 3. Launch the Gateway Server
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ---
 
-## 📡 API Endpoints & Usage Examples
+## 📡 API Reference
 
-### 1. OpenAI-Compatible Chat Completion (`POST /v1/chat/completions`)
+### 1. Chat Completion (`POST /v1/chat/completions`)
+
+#### Request
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "X-API-Key: sk-test-key-123" \
   -d '{
     "model": "gpt-4o-mini",
-    "messages": [{"role": "user", "content": "What is Kubernetes?"}],
+    "messages": [
+      {"role": "user", "content": "What is Kubernetes?"}
+    ],
     "temperature": 0.7
   }'
 ```
 
-**Response Headers**:
+#### Response Headers
 * `X-Cache-Status`: `HIT` or `MISS`
-* `X-Cache-Similarity`: Cosine similarity score (e.g. `0.9521`)
-* `X-Latency-Ms`: Monotonic elapsed latency (e.g. `16.45`)
-* `X-RateLimit-Remaining`: Remaining sliding window requests (e.g. `59`)
+* `X-Cache-Similarity`: Cosine similarity score (e.g., `0.9614`)
+* `X-Latency-Ms`: Monotonic latency in milliseconds (e.g., `15.82`)
+* `X-RateLimit-Remaining`: Remaining sliding-window requests (e.g., `59`)
 
-### 2. Live Operational Statistics (`GET /stats`)
-```bash
-curl -X GET http://localhost:8000/stats -H "X-API-Key: sk-test-key-123"
+#### Response Body
+```json
+{
+  "id": "chatcmpl-cache-a1b2c3d4",
+  "object": "chat.completion",
+  "created": 1787127600,
+  "model": "gpt-4o-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Kubernetes is an open-source container orchestration system for automating application deployment, scaling, and management."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 5,
+    "completion_tokens": 18,
+    "total_tokens": 23
+  }
+}
 ```
 
-**Example JSON Output**:
+---
+
+### 2. Live Telemetry & Usage Analytics (`GET /stats`)
+
+#### Request
+```bash
+curl -X GET http://localhost:8000/stats \
+  -H "X-API-Key: sk-test-key-123"
+```
+
+#### Response Body
 ```json
 {
   "total_requests": 22,
@@ -188,23 +266,23 @@ curl -X GET http://localhost:8000/stats -H "X-API-Key: sk-test-key-123"
   "upstream_calls_avoided": 6,
   "error_count": 0,
   "total_injections_blocked": 0,
-  "total_tokens_served": 1184,
-  "avg_latency_ms": 757.24,
+  "total_tokens_served": 555,
+  "avg_latency_ms": 759.09,
   "avg_cached_latency_ms": 15.0,
   "avg_upstream_latency_ms": 1038.12,
   "latency": {
-    "p50_ms": 1007.45,
-    "p95_ms": 1151.51,
-    "p99_ms": 1167.93
+    "p50_ms": 1002.93,
+    "p95_ms": 1144.63,
+    "p99_ms": 1166.29
   },
   "per_key_usage": {
-    "key_6d47b8e19c3d": {
+    "key_2d550185026d": {
       "requests": 22,
       "cache_hits": 6,
       "cache_hit_ratio": 0.2727,
-      "total_tokens": 1184,
-      "total_latency_ms": 16659.28,
-      "avg_latency_ms": 757.24,
+      "total_tokens": 555,
+      "total_latency_ms": 16699.97,
+      "avg_latency_ms": 759.09,
       "errors": 0
     }
   }
@@ -213,36 +291,103 @@ curl -X GET http://localhost:8000/stats -H "X-API-Key: sk-test-key-123"
 
 ---
 
-## 🧪 Automated Testing & Benchmarking
+## 📁 Repository Structure
 
-### Run Test Suite (16/16 Passing)
+```
+├── app/
+│   ├── main.py                     # FastAPI application, CORS, lifespan & middleware
+│   ├── config.py                   # Pydantic BaseSettings environment configuration
+│   ├── api/v1/routes.py            # /v1/chat/completions, /models, and /stats endpoints
+│   ├── schemas/                    # Pydantic schemas (OpenAI compatible & Gateway telemetry)
+│   ├── resilience/
+│   │   ├── auth.py                 # X-API-Key verification & secure key hashing
+│   │   ├── rate_limiter.py         # In-memory sliding-window rate limiter
+│   │   └── circuit_breaker.py      # Upstream provider fault tolerance
+│   ├── guardrails/
+│   │   ├── prompt_validator.py     # Prompt injection and jailbreak filter
+│   │   ├── pii_scrubber.py         # PII entity detection and anonymization
+│   │   └── output_guardrail.py     # Response verification and leak prevention
+│   ├── cache/
+│   │   ├── embeddings.py           # Sentence-Transformers (all-MiniLM-L6-v2)
+│   │   ├── chroma_store.py         # ChromaDB cosine vector store with tenant isolation
+│   │   └── semantic_cache.py       # Async cache manager & lookup logic
+│   ├── router/
+│   │   ├── providers.py            # OpenAI, Anthropic, Ollama, and Mock providers
+│   │   └── llm_router.py           # Priority fallback router
+│   ├── observability/
+│   │   ├── database.py             # Structured SQLite request logger & analytics
+│   │   ├── logging.py              # Structured JSON application logger
+│   │   └── metrics.py              # Prometheus metrics collector
+│   └── static/                     # Dark-mode dashboard UI (HTML/CSS/JS)
+├── tests/                          # 16 automated pytest unit & integration tests
+│   ├── test_auth.py                # API key verification & hashing tests
+│   ├── test_rate_limit.py          # Sliding-window rate limiter tests
+│   ├── test_prompt_validation.py   # Prompt injection & jailbreak tests
+│   ├── test_embeddings.py          # Sentence-Transformers embedding tests
+│   ├── test_semantic_cache.py      # ChromaDB caching & tenant isolation tests
+│   ├── test_sqlite_logging.py      # SQLite database audit logging tests
+│   ├── test_stats.py               # /stats metrics & percentile tests
+│   ├── test_gateway.py             # Complete proxy end-to-end flow tests
+│   └── test_benchmark_metrics.py   # Benchmark speedup & calculation tests
+├── benchmark.py                    # Official latency benchmark script
+├── benchmark_50_prompts.py         # 50-prompt test workload evaluation
+├── RESUME_CLAIM_AUDIT.md           # Claim-by-claim verification & evidence matrix
+├── Dockerfile                      # Production container image
+├── docker-compose.yml              # Container orchestration configuration
+└── requirements.txt                # Python project dependencies
+```
+
+---
+
+## 🧪 Automated Testing
+
+Run the automated test suite with pytest:
 ```bash
 pytest -v
 ```
 
-### Run Official Benchmark
-```bash
-python benchmark.py
+### Test Coverage (16/16 Passed)
+```
+tests/test_auth.py::test_api_key_hashing_security PASSED                 [  6%]
+tests/test_auth.py::test_auth_missing_api_key_rejected PASSED            [ 12%]
+tests/test_auth.py::test_auth_invalid_api_key_rejected PASSED            [ 18%]
+tests/test_auth.py::test_auth_valid_api_keys PASSED                      [ 25%]
+tests/test_benchmark_metrics.py::test_benchmark_speedup_and_percentiles PASSED [ 31%]
+tests/test_embeddings.py::test_embedding_engine_output_dimensions PASSED [ 37%]
+tests/test_embeddings.py::test_embedding_engine_unit_normalization PASSED [ 43%]
+tests/test_embeddings.py::test_embedding_batch_processing PASSED         [ 50%]
+tests/test_gateway.py::test_gateway_full_proxy_lifecycle PASSED          [ 56%]
+tests/test_prompt_validation.py::test_prompt_validator_safe_prompts PASSED [ 62%]
+tests/test_prompt_validation.py::test_prompt_validator_malicious_prompts PASSED [ 68%]
+tests/test_prompt_validation.py::test_prompt_validator_case_and_whitespace_variations PASSED [ 75%]
+tests/test_rate_limit.py::test_sliding_window_rate_limiter_burst_and_window PASSED [ 81%]
+tests/test_semantic_cache.py::test_semantic_cache_hit_miss_and_isolation PASSED [ 87%]
+tests/test_sqlite_logging.py::test_sqlite_request_logging_and_hashing PASSED [ 93%]
+tests/test_stats.py::test_stats_metrics_and_percentiles PASSED           [100%]
+
+============================== 16 passed in 15.40s ==============================
 ```
 
 ---
 
-## 🐳 Docker Setup
+## 🔒 Security & Tenant Isolation
 
-### Build & Run with Docker Compose
+1. **API Key Protection**: Raw client API keys are hashed with SHA-256 (`key_<hash>`) before logging. Database compromises cannot expose live client secrets.
+2. **Tenant Isolation in Vector Space**: ChromaDB collections enforce a `where={"api_key_hash": key_scope}` partition. Key A cannot access Key B's cached query responses.
+3. **Thread-Safe Rate Limiting**: In-memory rate limiting deques are synchronized using `threading.Lock`.
+4. **Adversarial Injection Defense**: Suspicious instruction patterns and delimiter injections are rejected at the edge before consuming upstream LLM tokens.
+
+---
+
+## 🐳 Docker Deployment
+
+The gateway is containerized and ready to deploy without requiring external paid API credentials:
+
 ```bash
 docker-compose up --build
 ```
-The gateway is immediately operational at `http://localhost:8000` with no external API credentials required.
 
----
-
-## 🔒 Security Review & Considerations
-
-1. **API Key Storage**: Raw API keys are never stored in SQLite. Only 12-character SHA-256 digest identifiers (`key_<hash>`) are saved.
-2. **Tenant Isolation**: ChromaDB collections enforce metadata filters on `api_key_hash`, guaranteeing that Client A cannot access Client B's cached query responses.
-3. **Sliding Window Thread Safety**: In-memory rate limiting deques are guarded with threading locks (`threading.Lock`).
-4. **Prompt Validation**: Rejecting prompt injection attempts before they reach upstream providers prevents context leakage and malicious override attacks.
+The gateway will be accessible at `http://localhost:8000` with automated health checks enabled.
 
 ---
 
